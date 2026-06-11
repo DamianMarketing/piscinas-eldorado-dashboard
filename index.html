@@ -548,28 +548,40 @@ let semData=[];
 function buildWeekFilter(rows){
   semData=rows;
   const filter=document.getElementById('week-filter');
-  const semNames=rows.map(r=>r[0]).filter(Boolean);
-  if(semNames.length===0){filter.innerHTML='';return;}
+  // Keep ALL rows that start with "Sem" — no filtering by data
+  const semRows=rows.filter(r=>r[0]&&/^sem\s*\d/i.test(r[0]));
+  if(semRows.length===0){filter.innerHTML='';if(rows.length>0)buildWeekKPIs(rows[0]);return;}
 
-  // Find sem with data (non-zero leads as proxy)
-  let defaultIdx=semNames.length-1;
-  for(let i=semNames.length-1;i>=0;i--){if(num(rows[i][9])>0){defaultIdx=i;break;}}
-  if(activeSem===0) activeSem=defaultIdx;
+  // Default to current week based on today's date
+  // Parse week date ranges from Col2 e.g. "01-07" or "01 al 07"
+  if(activeSem===0){
+    const today=new Date().getDate();
+    let best=0;
+    semRows.forEach((r,i)=>{
+      const fechas=r[1]||'';
+      const parts=fechas.replace(/\s+al\s+/,'-').split('-');
+      const start=parseInt(parts[0])||0;
+      const end=parseInt(parts[parts.length-1])||31;
+      if(today>=start&&today<=end) best=i;
+      else if(today>end) best=Math.min(i+1,semRows.length-1);
+    });
+    activeSem=best;
+  }
 
   filter.innerHTML='';
-  semNames.forEach((name,i)=>{
+  semRows.forEach((r,i)=>{
     const btn=document.createElement('button');
     btn.className='week-btn'+(i===activeSem?' active':'');
-    const fechas=rows[i][1]||'';
-    btn.innerHTML=`${name}${fechas?` <span style="opacity:.6;font-size:10px">· ${fechas}</span>`:''}`;
+    const fechas=r[1]||'';
+    btn.innerHTML=`${r[0]}${fechas?` <span style="opacity:.6;font-size:10px">· ${fechas}</span>`:''}`;
     btn.addEventListener('click',()=>{
       activeSem=i;
       document.querySelectorAll('.week-btn').forEach((b,j)=>b.classList.toggle('active',j===i));
-      buildWeekKPIs(rows[i]);
+      buildWeekKPIs(semRows[i]);
     });
     filter.appendChild(btn);
   });
-  buildWeekKPIs(rows[activeSem]||rows[0]);
+  buildWeekKPIs(semRows[activeSem]||semRows[0]);
 }
 
 // ══ WEEK KPIs ══
@@ -735,6 +747,15 @@ function buildSemanalTable(tableId,dataRows){
   }).join('');
 }
 
+// Filtra solo filas que son campañas reales del CSV_CAMPANAS
+function isCampanaValida(r){
+  if(!r||!r[0]) return false;
+  const nombre=r[0].trim();
+  const gasto=num(r[1]);
+  const flag=(r[12]||'').toUpperCase();
+  return nombre.startsWith('#') && gasto>0 && (flag.includes('CLAVE')||flag.includes('OPORTUNIDAD')||flag.includes('OPTIMIZAR'));
+}
+
 // ══ CAMPAÑAS TABLE (mini) ══
 function buildCampanasTable(tableId,data){
   const thead=document.querySelector(`#${tableId} thead`);
@@ -743,12 +764,12 @@ function buildCampanasTable(tableId,data){
     thead.innerHTML='';tbody.innerHTML='<tr><td class="no-data"><span class="nd-badge">Sin datos de campañas</span></td></tr>';return;
   }
   thead.innerHTML='<tr>'+['Campaña','Gasto ARS','Imp.','Clics','CTR%','Leads','CPL','Flag'].map(h=>`<th>${h}</th>`).join('')+'</tr>';
-  const rows=data.slice(3).filter(r=>r[0]&&!r[0].toUpperCase().includes('TOTAL')&&r[0].trim()!=='');
+  const rows=data.slice(3).filter(isCampanaValida);
   tbody.innerHTML=rows.map(r=>{
     const flag=r[12]||'';let fc='flag-azul';
-    if(flag.toLowerCase().includes('roj')) fc='flag-rojo';
-    else if(flag.toLowerCase().includes('amar')) fc='flag-amarillo';
-    else if(flag.toLowerCase().includes('verd')) fc='flag-verde';
+    if(flag.toUpperCase().includes('CLAVE')) fc='flag-verde';
+    else if(flag.toUpperCase().includes('OPTIMIZAR')) fc='flag-amarillo';
+    else if(flag.toUpperCase().includes('OPORTUNIDAD')) fc='flag-azul';
     return `<tr>
       <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis" title="${r[0]}">${r[0]||'—'}</td>
       <td>${fmt(num(r[1]))}</td><td>${fmtN(num(r[2]))}</td><td>${fmtN(num(r[4]))}</td>
@@ -757,6 +778,7 @@ function buildCampanasTable(tableId,data){
       <td>${flag?`<span class="flag-badge ${fc}">${flag}</span>`:'—'}</td>
     </tr>`;
   }).join('');
+  if(rows.length===0) tbody.innerHTML='<tr><td colspan="8" class="no-data"><span class="nd-badge">Sin campañas activas con datos</span></td></tr>';
 }
 
 // ══ CAMPAÑAS (tab) ══
@@ -768,7 +790,7 @@ function buildCampanas(data){
     destroyChart('chart-inv-camp');destroyChart('chart-cpl-camp');return;
   }
   thead.innerHTML='<tr>'+['Campaña','Gasto ARS','Imp.','Alcance','Clics','CTR%','Leads','Calif 60%','Ventas Est.','CPL Gross','CPM','Frec.','Flag'].map(h=>`<th>${h}</th>`).join('')+'</tr>';
-  const rows=data.slice(3).filter(r=>r[0]&&!r[0].toUpperCase().includes('TOTAL')&&r[0].trim()!=='');
+  const rows=data.slice(3).filter(isCampanaValida);
   const names=[];const invs=[];const cpls=[];
   tbody.innerHTML=rows.map(r=>{
     const flag=r[12]||'';let fc='flag-azul';
@@ -814,60 +836,96 @@ function buildCreatividades(data){
   const map={};
   rows.forEach(r=>{
     const name=r[3].trim();
-    if(!map[name]) map[name]={name,spend:0,imp:0,alcance:0,clics:0,leads:0,frec:[]};
-    map[name].spend+=num(r[4]);map[name].imp+=num(r[6]);map[name].alcance+=num(r[7]);
-    map[name].clics+=num(r[8]);map[name].leads+=num(r[10]);
-    if(r[12]) map[name].frec.push(parseFloat(r[12])||0);
+    if(!map[name]) map[name]={name,spend:0,imp:0,alcance:0,clics:0,conv:0};
+    map[name].spend+=num(r[4]);   // Col5 SpendARS
+    map[name].imp+=num(r[6]);     // Col7 Impresiones — para frecuencia real
+    map[name].alcance+=num(r[7]); // Col8 Alcance — para frecuencia real
+    map[name].clics+=num(r[8]);   // Col9 Clics
+    map[name].conv+=num(r[10]);   // Col11 Leads/Conversaciones WPP
   });
-  const list=Object.values(map).map(c=>{
-    c.cpl=c.leads>0?c.spend/c.leads:0;
-    c.ctr=c.imp>0?c.clics/c.imp*100:0;
-    c.frecAvg=c.frec.length>0?c.frec.reduce((a,b)=>a+b,0)/c.frec.length:0;
-    return c;
-  }).filter(c=>c.leads>0).sort((a,b)=>a.cpl-b.cpl);
 
-  document.getElementById('top3-grid').innerHTML=list.slice(0,3).map((c,i)=>`
+  const list=Object.values(map).map(c=>{
+    // Frecuencia correcta: SUM(Imp) / SUM(Alcance)
+    c.frecAvg=c.alcance>0?c.imp/c.alcance:0;
+    // Costo por conversación WPP: SUM(Spend) / SUM(Conv)
+    c.costoConv=c.conv>0?c.spend/c.conv:null;
+    c.ctr=c.imp>0?c.clics/c.imp*100:0;
+    return c;
+  });
+
+  // Ordenar: con conversaciones primero (ASC por costo), sin conversiones al final
+  list.sort((a,b)=>{
+    if(a.costoConv===null&&b.costoConv===null) return 0;
+    if(a.costoConv===null) return 1;
+    if(b.costoConv===null) return -1;
+    return a.costoConv-b.costoConv;
+  });
+
+  const withConv=list.filter(c=>c.costoConv!==null);
+
+  document.getElementById('top3-grid').innerHTML=withConv.slice(0,3).map((c,i)=>`
     <div class="top3-card">
       <div class="top3-medal">${['🏆','🥈','🥉'][i]}</div>
       <div class="top3-name">${c.name}</div>
-      <div class="top3-cpl">${fmt(c.cpl)}</div>
-      <div class="top3-cpl-label">CPL</div>
+      <div class="top3-cpl">${fmt(c.costoConv)}</div>
+      <div class="top3-cpl-label">Costo/Conv. WPP</div>
       <div class="top3-stats">
         <div class="top3-stat"><strong>${fmtPct(c.ctr)}</strong>CTR</div>
         <div class="top3-stat"><strong>${fmtN(c.alcance)}</strong>Alcance</div>
-        <div class="top3-stat"><strong>${Math.round(c.leads)}</strong>Leads</div>
+        <div class="top3-stat"><strong>${Math.round(c.conv)}</strong>Conv. WPP</div>
       </div>
-      ${c.frecAvg>3?`<div class="rotate-badge">⚠️ Rotar — Frec. ${c.frecAvg.toFixed(1)}</div>`:''}
+      ${c.frecAvg>3?`<div class="rotate-badge">⚠️ Rotar — Frec. ${c.frecAvg.toFixed(2)}</div>`:''}
     </div>
   `).join('');
 
   destroyChart('chart-scatter');
+  const scatterData=withConv.map(c=>({
+    x:+c.ctr.toFixed(2),y:+c.costoConv.toFixed(0),
+    r:Math.max(5,Math.min(28,c.spend/5000)),
+    name:c.name,conv:Math.round(c.conv)
+  }));
   chartInstances['chart-scatter']=new Chart(document.getElementById('chart-scatter'),{
     type:'bubble',
     data:{datasets:[{
       label:'Anuncios',
-      data:list.map(c=>({x:+c.ctr.toFixed(2),y:+c.cpl.toFixed(0),r:Math.max(5,Math.min(28,c.spend/5000)),name:c.name,leads:c.leads})),
-      backgroundColor:list.map((_,i)=>i<3?'rgba(37,99,235,0.7)':'rgba(37,99,235,0.3)'),
-      borderColor:list.map((_,i)=>i<3?'#2563eb':'#93c5fd'),borderWidth:1.5
+      data:scatterData,
+      backgroundColor:scatterData.map((_,i)=>i<3?'rgba(37,99,235,0.7)':'rgba(37,99,235,0.3)'),
+      borderColor:scatterData.map((_,i)=>i<3?'#2563eb':'#93c5fd'),borderWidth:1.5
     }]},
-    options:{responsive:true,maintainAspectRatio:false,...CHART_DEFAULTS,plugins:{...CHART_DEFAULTS.plugins,legend:{display:false},tooltip:{...CHART_DEFAULTS.plugins.tooltip,callbacks:{label:c=>[c.raw.name,`CPL: ${fmt(c.raw.y)}`,`CTR: ${c.raw.x}%`,`Leads: ${c.raw.leads}`]}}},
-    scales:{x:{...CHART_DEFAULTS.scales.x,title:{display:true,text:'CTR (%)',color:'#6b7280',font:{size:11}}},y:{...CHART_DEFAULTS.scales.y,title:{display:true,text:'CPL ($)',color:'#6b7280',font:{size:11}},ticks:{...CHART_DEFAULTS.scales.y.ticks,callback:v=>fmt(v)}}}}
+    options:{responsive:true,maintainAspectRatio:false,...CHART_DEFAULTS,
+      plugins:{...CHART_DEFAULTS.plugins,legend:{display:false},
+        tooltip:{...CHART_DEFAULTS.plugins.tooltip,callbacks:{label:c=>[
+          c.raw.name,
+          `Costo por conversación WPP: ${fmt(c.raw.y)}`,
+          `CTR: ${c.raw.x}%`,
+          `Conv. WPP: ${c.raw.conv}`
+        ]}}},
+      scales:{
+        x:{...CHART_DEFAULTS.scales.x,title:{display:true,text:'CTR (%)',color:'#6b7280',font:{size:11}}},
+        y:{...CHART_DEFAULTS.scales.y,title:{display:true,text:'Costo/Conv. WPP ($)',color:'#6b7280',font:{size:11}},ticks:{...CHART_DEFAULTS.scales.y.ticks,callback:v=>fmt(v)}}
+      }
+    }
   });
 
   const thead=document.querySelector('#tabla-creatividades thead');
   const tbody=document.querySelector('#tabla-creatividades tbody');
-  thead.innerHTML='<tr>'+['#','Anuncio','Inversión','Leads','CPL','CTR','Alcance','Frecuencia','Estado'].map(h=>`<th>${h}</th>`).join('')+'</tr>';
+  thead.innerHTML='<tr>'+['#','Anuncio','Inversión','Conv. WPP','Costo/Conv. WPP','CTR','Alcance','Frecuencia','Estado'].map(h=>`<th>${h}</th>`).join('')+'</tr>';
   tbody.innerHTML=list.map((c,i)=>{
+    const costo=c.costoConv;
     let semCol='#16a34a';
-    if(c.cpl>OBJ.cpl*1.3) semCol='#dc2626';
-    else if(c.cpl>OBJ.cpl) semCol='#d97706';
+    if(costo===null) semCol='#9ca3af';
+    else if(costo>OBJ.cpl*1.3) semCol='#dc2626';
+    else if(costo>OBJ.cpl) semCol='#d97706';
+    const rankIdx=withConv.indexOf(c);
     return `<tr>
-      <td><strong style="color:${i<3?'#d97706':'var(--sub)'}">${i+1}</strong></td>
+      <td><strong style="color:${rankIdx>=0&&rankIdx<3?'#d97706':'var(--sub)'}">${i+1}</strong></td>
       <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis" title="${c.name}">${c.name}</td>
-      <td>${fmt(c.spend)}</td><td><strong>${Math.round(c.leads)}</strong></td>
-      <td><span class="semaforo" style="background:${semCol}"></span>${fmt(c.cpl)}</td>
-      <td>${fmtPct(c.ctr)}</td><td>${fmtN(c.alcance)}</td>
-      <td>${c.frecAvg.toFixed(2)}</td>
+      <td>${fmt(c.spend)}</td>
+      <td><strong>${costo!==null?Math.round(c.conv):'—'}</strong></td>
+      <td>${costo!==null?`<span class="semaforo" style="background:${semCol}"></span>${fmt(costo)}`:'<span style="color:var(--sub)">Sin conv.</span>'}</td>
+      <td>${fmtPct(c.ctr)}</td>
+      <td>${fmtN(c.alcance)}</td>
+      <td>${c.frecAvg>0?c.frecAvg.toFixed(2):'—'}</td>
       <td>${c.frecAvg>3?'<span class="kpi-badge badge-yellow">⚠ Rotar</span>':'<span class="kpi-badge badge-green">OK</span>'}</td>
     </tr>`;
   }).join('');
