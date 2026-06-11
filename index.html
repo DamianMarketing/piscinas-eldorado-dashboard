@@ -399,9 +399,41 @@ function parseCSV(text){
   return rows.filter(r=>r.some(c=>c!==''));
 }
 
+// PROBLEMA 1 — siempre fresco, sin caché del browser
 async function fetchCSV(key){
-  try{const r=await fetch(CSV[key]);if(!r.ok)throw new Error(r.status);return parseCSV(await r.text());}
-  catch(e){console.warn('CSV fail:',key,e);return null;}
+  try{
+    const url=`${CSV[key]}&t=${Date.now()}`;
+    const r=await fetch(url,{cache:'no-store'});
+    if(!r.ok) throw new Error(r.status);
+    return parseCSV(await r.text());
+  }catch(e){console.warn('CSV fail:',key,e);return null;}
+}
+
+// PROBLEMA 2 — parsers especializados por CSV
+function parseSemanal(data){
+  // data = resultado de parseCSV (array de arrays)
+  // Buscar por contenido, NO por índice fijo
+  const semRows=data.filter(r=>r[0]&&/^Sem\s*[1-4]$/i.test(r[0].toString().trim()));
+  const totalRow=data.find(r=>r[0]&&r[0].toString().trim().toUpperCase().includes('TOTAL MES'));
+  semRows.sort((a,b)=>{
+    const na=parseInt(a[0].replace(/\D/g,''))||0;
+    const nb=parseInt(b[0].replace(/\D/g,''))||0;
+    return na-nb;
+  });
+  console.log('[semanal] Semanas:',semRows.map(r=>r[0]),'Total:',totalRow?totalRow[0]:'NO ENCONTRADA');
+  return {semRows,totalRow};
+}
+
+// PROBLEMA 4 — parser campañas: solo filas reales
+function parseCampanas(data){
+  const campanas=data.filter(r=>{
+    const nombre=(r[0]||'').toString().trim();
+    const gasto=parseFloat((r[1]||'').toString().replace(/[$.\s]/g,'').replace(',','.'))||0;
+    return nombre.startsWith('#')&&gasto>0;
+  });
+  const totalesRow=data.find(r=>(r[0]||'').toString().trim().toUpperCase()==='TOTALES DE CUENTA');
+  console.log('[campanas] Válidas:',campanas.map(r=>r[0]));
+  return {campanas,totalesRow};
 }
 
 let chartInstances={};
@@ -481,8 +513,26 @@ function renderMonth(){
 async function loadAll(){
   document.getElementById('loader').classList.remove('hide');
   document.getElementById('btnRefresh').classList.add('spinning');
-  const [c,r,s,h,p]=await Promise.all([fetchCSV('campanas'),fetchCSV('raw'),fetchCSV('semanal'),fetchCSV('historial'),fetchCSV('pipeline')]);
-  DATA={campanas:c,raw:r,semanal:s,historial:h,pipeline:p};
+
+  // Fetch todos frescos, sin caché
+  const [rawC,rawR,rawS,rawH,rawP]=await Promise.all([
+    fetchCSV('campanas'),fetchCSV('raw'),fetchCSV('semanal'),fetchCSV('historial'),fetchCSV('pipeline')
+  ]);
+
+  // Aplicar parsers especializados
+  const campanasParsed = rawC ? parseCampanas(rawC) : {campanas:[],totalesRow:null};
+  const semanalParsed  = rawS ? parseSemanal(rawS)  : {semRows:[],totalRow:null};
+
+  DATA={
+    campanas:rawC, campanasParsed,
+    raw:rawR,
+    semanal:rawS,  semanalParsed,
+    historial:rawH,
+    pipeline:rawP
+  };
+
+  // Reset semana activa en cada carga completa
+  activeSem=-1;
 
   buildMonthSelector();
   renderMonth();
@@ -497,31 +547,32 @@ async function loadAll(){
 
 // ══ METRICAS (mes actual) ══
 function buildMetricas(dataSemanal,dataCampanas){
-  const semRows=dataSemanal?dataSemanal.slice(5).filter(r=>r[0]&&r[0].trim()!==''):[];
-  const dataRows=semRows.filter(r=>!String(r[0]).toUpperCase().includes('OBJETIVO'));
-  const realSems=dataRows.filter(r=>!String(r[0]).toUpperCase().includes('TOTAL'));
+  // Usar el parser especializado ya procesado
+  const {semRows,totalRow}=DATA.semanalParsed||{semRows:[],totalRow:null};
 
-  // Period label
-  if(realSems.length>0){
-    const first=realSems[0][1]||'';const last=realSems[realSems.length-1][1]||'';
+  // Period label: rango de fechas de la primera a la última semana
+  if(semRows.length>0){
+    const first=semRows[0][1]||'';
+    const last=semRows[semRows.length-1][1]||'';
     document.getElementById('metricas-period').textContent=first+(last&&last!==first?' → '+last:'');
   }
   document.getElementById('seguimiento-title').textContent='Seguimiento Mensual — '+(activeMonth?.period||'');
 
-  // Week filter
-  buildWeekFilter(realSems);
+  // Selector de semanas (todas, sin filtrar)
+  buildWeekFilter(semRows);
 
-  // Funnel + rings + alerts from total row
-  const totalRow=dataRows.find(r=>String(r[0]).toUpperCase().includes('TOTAL'))||realSems[realSems.length-1];
-  buildFunnelRingsAlerts(totalRow,dataSemanal);
+  // Funnel + rings + alerts con totales del mes
+  const efectivoTotal=totalRow||semRows[semRows.length-1]||null;
+  buildFunnelRingsAlerts(efectivoTotal,dataSemanal);
 
-  // Semanal table in home
-  buildSemanalTable('tabla-semanal-home',dataRows);
+  // Tabla semanal: semanas + fila total
+  const tableRows=[...semRows,...(totalRow?[totalRow]:[])];
+  buildSemanalTable('tabla-semanal-home',tableRows);
 
-  // Progress
-  buildProgressBar('progress-inv',totalRow?num(totalRow[3]):0);
+  // Progress bar
+  buildProgressBar('progress-inv',efectivoTotal?num(efectivoTotal[3]):0);
 
-  // Campañas table in home
+  // Campañas tabla
   buildCampanasTable('tabla-campanas-home',dataCampanas);
 }
 
@@ -543,28 +594,17 @@ function buildMetricasFromHistorial(m){
   buildCampanasTable('tabla-campanas-home',null);
 }
 
-// ══ WEEK FILTER ══
+// ══ WEEK FILTER — PROBLEMA 3 ══
 let semData=[];
-function buildWeekFilter(rows){
-  semData=rows;
+function buildWeekFilter(semRows){
+  semData=semRows;
   const filter=document.getElementById('week-filter');
-  // Keep ALL rows that start with "Sem" — no filtering by data
-  const semRows=rows.filter(r=>r[0]&&/^sem\s*\d/i.test(r[0]));
-  if(semRows.length===0){filter.innerHTML='';if(rows.length>0)buildWeekKPIs(rows[0]);return;}
+  if(!semRows||semRows.length===0){filter.innerHTML='<span style="font-size:12px;color:var(--sub)">Sin semanas disponibles</span>';return;}
 
-  // Default to current week based on today's date
-  // Parse week date ranges from Col2 e.g. "01-07" or "01 al 07"
-  if(activeSem===0){
-    const today=new Date().getDate();
+  // PROBLEMA 3: semana activa = ÚLTIMA con INV REAL > 0; fallback = Sem 1
+  if(activeSem===-1){
     let best=0;
-    semRows.forEach((r,i)=>{
-      const fechas=r[1]||'';
-      const parts=fechas.replace(/\s+al\s+/,'-').split('-');
-      const start=parseInt(parts[0])||0;
-      const end=parseInt(parts[parts.length-1])||31;
-      if(today>=start&&today<=end) best=i;
-      else if(today>end) best=Math.min(i+1,semRows.length-1);
-    });
+    semRows.forEach((r,i)=>{if(num(r[3])>0) best=i;});
     activeSem=best;
   }
 
@@ -572,7 +612,7 @@ function buildWeekFilter(rows){
   semRows.forEach((r,i)=>{
     const btn=document.createElement('button');
     btn.className='week-btn'+(i===activeSem?' active':'');
-    const fechas=r[1]||'';
+    const fechas=(r[1]||'').trim();
     btn.innerHTML=`${r[0]}${fechas?` <span style="opacity:.6;font-size:10px">· ${fechas}</span>`:''}`;
     btn.addEventListener('click',()=>{
       activeSem=i;
@@ -747,56 +787,49 @@ function buildSemanalTable(tableId,dataRows){
   }).join('');
 }
 
-// Filtra solo filas que son campañas reales del CSV_CAMPANAS
-function isCampanaValida(r){
-  if(!r||!r[0]) return false;
-  const nombre=r[0].trim();
-  const gasto=num(r[1]);
-  const flag=(r[12]||'').toUpperCase();
-  return nombre.startsWith('#') && gasto>0 && (flag.includes('CLAVE')||flag.includes('OPORTUNIDAD')||flag.includes('OPTIMIZAR'));
+// Renderiza filas de campañas (helper compartido)
+function renderFlagBadge(flag){
+  const f=(flag||'').toUpperCase();
+  let fc='flag-azul';
+  if(f.includes('CLAVE')) fc='flag-verde';
+  else if(f.includes('OPTIMIZAR')) fc='flag-amarillo';
+  else if(f.includes('OPORTUNIDAD')) fc='flag-azul';
+  else if(f.includes('ROJ')||f.includes('PAUS')) fc='flag-rojo';
+  return flag?`<span class="flag-badge ${fc}">${flag}</span>`:'—';
 }
 
 // ══ CAMPAÑAS TABLE (mini) ══
 function buildCampanasTable(tableId,data){
   const thead=document.querySelector(`#${tableId} thead`);
   const tbody=document.querySelector(`#${tableId} tbody`);
-  if(!data){
-    thead.innerHTML='';tbody.innerHTML='<tr><td class="no-data"><span class="nd-badge">Sin datos de campañas</span></td></tr>';return;
+  // Usar campanasParsed si disponible
+  const rows=DATA.campanasParsed?.campanas||[];
+  if(!data||rows.length===0){
+    thead.innerHTML='';
+    tbody.innerHTML='<tr><td class="no-data"><span class="nd-badge">Sin campañas activas con datos</span></td></tr>';return;
   }
   thead.innerHTML='<tr>'+['Campaña','Gasto ARS','Imp.','Clics','CTR%','Leads','CPL','Flag'].map(h=>`<th>${h}</th>`).join('')+'</tr>';
-  const rows=data.slice(3).filter(isCampanaValida);
-  tbody.innerHTML=rows.map(r=>{
-    const flag=r[12]||'';let fc='flag-azul';
-    if(flag.toUpperCase().includes('CLAVE')) fc='flag-verde';
-    else if(flag.toUpperCase().includes('OPTIMIZAR')) fc='flag-amarillo';
-    else if(flag.toUpperCase().includes('OPORTUNIDAD')) fc='flag-azul';
-    return `<tr>
-      <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis" title="${r[0]}">${r[0]||'—'}</td>
-      <td>${fmt(num(r[1]))}</td><td>${fmtN(num(r[2]))}</td><td>${fmtN(num(r[4]))}</td>
-      <td>${fmtPct(pct(r[5]))}</td><td><strong>${Math.round(num(r[6]))||'—'}</strong></td>
-      <td>${fmt(num(r[9]))}</td>
-      <td>${flag?`<span class="flag-badge ${fc}">${flag}</span>`:'—'}</td>
-    </tr>`;
-  }).join('');
-  if(rows.length===0) tbody.innerHTML='<tr><td colspan="8" class="no-data"><span class="nd-badge">Sin campañas activas con datos</span></td></tr>';
+  tbody.innerHTML=rows.map(r=>`<tr>
+    <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis" title="${r[0]}">${r[0]||'—'}</td>
+    <td>${fmt(num(r[1]))}</td><td>${fmtN(num(r[2]))}</td><td>${fmtN(num(r[4]))}</td>
+    <td>${fmtPct(pct(r[5]))}</td><td><strong>${Math.round(num(r[6]))||'—'}</strong></td>
+    <td>${fmt(num(r[9]))}</td><td>${renderFlagBadge(r[12])}</td>
+  </tr>`).join('');
 }
 
 // ══ CAMPAÑAS (tab) ══
 function buildCampanas(data){
   const thead=document.querySelector('#tabla-campanas thead');
   const tbody=document.querySelector('#tabla-campanas tbody');
-  if(!data){
-    tbody.innerHTML='<tr><td colspan="13" class="no-data"><span class="nd-badge">⚠ Sin datos</span></td></tr>';
+  const rows=DATA.campanasParsed?.campanas||[];
+  if(!data||rows.length===0){
+    thead.innerHTML='';
+    tbody.innerHTML='<tr><td colspan="13" class="no-data"><span class="nd-badge">⚠ Sin datos de campañas</span></td></tr>';
     destroyChart('chart-inv-camp');destroyChart('chart-cpl-camp');return;
   }
   thead.innerHTML='<tr>'+['Campaña','Gasto ARS','Imp.','Alcance','Clics','CTR%','Leads','Calif 60%','Ventas Est.','CPL Gross','CPM','Frec.','Flag'].map(h=>`<th>${h}</th>`).join('')+'</tr>';
-  const rows=data.slice(3).filter(isCampanaValida);
   const names=[];const invs=[];const cpls=[];
   tbody.innerHTML=rows.map(r=>{
-    const flag=r[12]||'';let fc='flag-azul';
-    if(flag.toLowerCase().includes('roj')) fc='flag-rojo';
-    else if(flag.toLowerCase().includes('amar')) fc='flag-amarillo';
-    else if(flag.toLowerCase().includes('verd')) fc='flag-verde';
     names.push(r[0]||'');invs.push(num(r[1]));cpls.push(num(r[9]));
     return `<tr>
       <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis" title="${r[0]}">${r[0]||'—'}</td>
@@ -806,7 +839,7 @@ function buildCampanas(data){
       <td>${Math.round(num(r[7]))||'—'}</td><td>${r[8]||'—'}</td>
       <td>${fmt(num(r[9]))}</td><td>${fmt(num(r[10]))}</td>
       <td>${parseFloat(r[11]||0).toFixed(2)||'—'}</td>
-      <td>${flag?`<span class="flag-badge ${fc}">${flag}</span>`:'—'}</td>
+      <td>${renderFlagBadge(r[12])}</td>
     </tr>`;
   }).join('');
 
@@ -933,26 +966,36 @@ function buildCreatividades(data){
 
 // ══ SEGUIMIENTO (tab) ══
 function buildSeguimiento(data){
-  buildProgressBar('progress-inv-seg',data?
-    (()=>{const rows=data.slice(5).filter(r=>r[0]&&!String(r[0]).toUpperCase().includes('OBJETIVO'));
-     const tot=rows.find(r=>String(r[0]).toUpperCase().includes('TOTAL'));
-     return tot?num(tot[3]):rows.reduce((s,r)=>s+num(r[3]),0);})():0);
+  // Usar parseSemanal para consistencia
+  const {semRows,totalRow}=data?parseSemanal(data):{semRows:[],totalRow:null};
+  const invAcum=totalRow?num(totalRow[3]):semRows.reduce((s,r)=>s+num(r[3]),0);
+  buildProgressBar('progress-inv-seg',invAcum);
 
-  const semRows=data?data.slice(5).filter(r=>r[0]&&r[0].trim()!==''&&!String(r[0]).toUpperCase().includes('OBJETIVO')):[];
-  const realSems=semRows.filter(r=>!String(r[0]).toUpperCase().includes('TOTAL'));
-  buildSemanalTable('tabla-semanal-full',semRows);
+  // Tabla: todas las semanas + total
+  const tableRows=[...semRows,...(totalRow?[totalRow]:[])];
+  buildSemanalTable('tabla-semanal-full',tableRows);
 
+  // PROBLEMA ADICIONAL — gráfico con TODAS las semanas, beginAtZero:true
   destroyChart('chart-semanal');
-  if(realSems.length>0){
+  if(semRows.length>0){
     chartInstances['chart-semanal']=new Chart(document.getElementById('chart-semanal'),{
-      data:{labels:realSems.map(r=>r[0]),datasets:[
-        {type:'bar',label:'Inversión ARS',data:realSems.map(r=>num(r[3])),backgroundColor:'rgba(37,99,235,0.4)',borderColor:'#2563eb',borderWidth:1,borderRadius:4,yAxisID:'y'},
-        {type:'line',label:'Leads',data:realSems.map(r=>num(r[9])),borderColor:'#0891b2',backgroundColor:'rgba(8,145,178,0.08)',borderWidth:2,pointBackgroundColor:'#0891b2',pointRadius:5,tension:.3,yAxisID:'y1'}
-      ]},
+      data:{
+        labels:semRows.map(r=>r[0]),  // ["Sem 1","Sem 2","Sem 3","Sem 4"]
+        datasets:[
+          {type:'bar',label:'Inversión ARS',
+           data:semRows.map(r=>parseFloat(r[3])||0),  // Col4 INV REAL, $0 si vacío
+           backgroundColor:'rgba(37,99,235,0.4)',borderColor:'#2563eb',borderWidth:1,borderRadius:4,yAxisID:'y'},
+          {type:'line',label:'Leads',
+           data:semRows.map(r=>parseInt(r[9])||0),     // Col10 LEADS, 0 si vacío
+           borderColor:'#0891b2',backgroundColor:'rgba(8,145,178,0.08)',
+           borderWidth:2,pointBackgroundColor:'#0891b2',pointRadius:5,tension:.3,yAxisID:'y1'}
+        ]
+      },
       options:{responsive:true,maintainAspectRatio:false,...CHART_DEFAULTS,scales:{
         x:{...CHART_DEFAULTS.scales.x,grid:{display:false}},
-        y:{...CHART_DEFAULTS.scales.y,position:'left',ticks:{...CHART_DEFAULTS.scales.y.ticks,callback:v=>fmt(v)}},
-        y1:{position:'right',ticks:{color:'#0891b2'},grid:{display:false}}
+        y:{...CHART_DEFAULTS.scales.y,position:'left',beginAtZero:true,
+           ticks:{...CHART_DEFAULTS.scales.y.ticks,callback:v=>fmt(v)}},
+        y1:{position:'right',beginAtZero:true,ticks:{color:'#0891b2'},grid:{display:false}}
       }}
     });
   }
